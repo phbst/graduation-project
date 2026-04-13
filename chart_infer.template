@@ -1,0 +1,44 @@
+你是一位数据可视化分析专家。请根据用户问题、SQL语句和SQL结果，判断是否适合用图表展示。
+
+要求：
+1. 如果结果不适合图表展示，例如只有一条纯文本结论、字段没有明确维度和指标、或者表格更清晰，请返回 should_visualize=false。
+2. 如果适合展示，请从 bar、line、pie、scatter 里选择最易理解的一种。
+3. 优先选择最少认知负担的图表，不要为了可视化而可视化。
+4. x_field 应是维度字段，y_field 应是数值指标字段。
+5. series_field 只有在确实需要分组对比时才返回，否则设为 null。
+6. reason 用一句简短中文说明判断原因。
+7. 只输出 JSON，不要输出任何解释、Markdown 或代码块。
+
+用户问题:
+{query}
+
+SQL语句:
+{sql}
+
+返回列:
+{columns}
+
+结果总行数:
+{row_count}
+
+结果预览:
+{preview_data}
+
+请严格返回如下 JSON 结构：
+{{
+  "should_visualize": true,
+  "chart": {{
+    "chart_type": "bar",
+    "title": "示例标题",
+    "x_field": "维度字段名",
+    "y_field": "指标字段名",
+    "series_field": null,
+    "reason": "为什么这种图更合适"
+  }}
+}}
+
+如果不适合图表展示，请返回：
+{{
+  "should_visualize": false,
+  "chart": null
+}}
