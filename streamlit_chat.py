@@ -194,6 +194,14 @@ def fetch_table_schema(table_name):
         return None
 
 
+def fetch_es_recall(table_name, query, topk):
+    try:
+        payload = {"table_name": table_name, "query": query, "topk": topk}
+        return requests.post(f"{API_BASE_URL}/es/recall", json=payload).json()
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 def import_excel_file(uploaded_file, table_name, sheet_name=None, if_exists="replace"):
     try:
         uploaded_file.seek(0)
@@ -278,12 +286,18 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 if "multi_table_mode" not in st.session_state:
     st.session_state.multi_table_mode = False
+if "selected_tables" not in st.session_state:
+    st.session_state.selected_tables = []
+if "selected_table" not in st.session_state:
+    st.session_state.selected_table = None
+if "selected_model" not in st.session_state:
+    st.session_state.selected_model = None
 
 
 # ========== 侧边栏 ==========
 with st.sidebar:
     st.markdown('<div class="sidebar-header"><h2>⚙️ 控制台</h2></div>', unsafe_allow_html=True)
-    page = st.radio("功能模块:", ["💬 智能对话", "⌨️ SQL 运行器", "📂 数据库浏览", "📥 导入表格", "🗑️ 删除表格"])
+    page = st.radio("功能模块:", ["💬 智能对话", "⌨️ SQL 运行器", "🔎 ES召回", "📂 数据库浏览", "📥 导入表格", "🗑️ 删除表格"])
 
     health = check_api_health()
     if health:
@@ -330,6 +344,24 @@ if page == "💬 智能对话":
             if message["role"] == "user":
                 st.markdown(f'<div class="user-message"><strong>{CHAT_AVATAR_USER} 用户:</strong><br>{message["content"]}</div>', unsafe_allow_html=True)
             else:
+                if message.get("matched_schema"):
+                    st.markdown("#### ES 召回列")
+                    recall_rows = []
+                    for table_meta in message["matched_schema"]:
+                        table_name = table_meta.get("table_name", "-")
+                        selected_columns = table_meta.get("selected_columns", [])
+                        for item in selected_columns:
+                            recall_rows.append({
+                                "表名": table_name,
+                                "字段名称": item.get("column_name"),
+                            })
+
+                    if recall_rows:
+                        recall_df = pd.DataFrame(recall_rows)
+                        st.dataframe(recall_df, use_container_width=True, hide_index=True)
+                    else:
+                        st.info("本次查询没有可展示的 ES 召回字段。")
+
                 if "sql" in message:
                     st.markdown(f'<div class="sql-box"><strong>🔍 生成 SQL:</strong><br><code>{message["sql"]}</code></div>', unsafe_allow_html=True)
                 if "data" in message and message["data"]:
@@ -380,6 +412,7 @@ if page == "💬 智能对话":
                             "role": "assistant",
                             "sql": res.get("sql"),
                             "data": res.get("data"),
+                            "matched_schema": res.get("matched_schema"),
                             "chart": chart,
                         })
                     else:
@@ -407,6 +440,45 @@ elif page == "⌨️ SQL 运行器":
                         st.dataframe(pd.DataFrame(res["data"]), use_container_width=True)
                 else:
                     st.error(f"SQL 报错: {res.get('error')}")
+
+elif page == "🔎 ES召回":
+    st.markdown('<div class="custom-title">🔎 ES Recall Playground</div>', unsafe_allow_html=True)
+    tables_res = fetch_tables()
+    if tables_res and tables_res.get("success") and tables_res.get("tables"):
+        selected_table = st.selectbox("选择表:", tables_res["tables"], key="es_recall_table")
+        recall_query = st.text_area("输入 query:", placeholder="例如：查找和基金经理相关的字段", height=120)
+        topk = st.number_input("TopK", min_value=1, max_value=100, value=10, step=1)
+        if st.button("🔍 执行 ES召回", type="primary"):
+            if not recall_query.strip():
+                st.error("请输入 query")
+            else:
+                with st.spinner("ES 召回中..."):
+                    res = fetch_es_recall(selected_table, recall_query.strip(), int(topk))
+                if res.get("success"):
+                    hits = res.get("hits") or []
+                    st.success(f"召回成功，共返回 {len(hits)} 条结果")
+                    if hits:
+                        hits_df = pd.DataFrame([
+                            {
+                                "表名": item.get("table_name"),
+                                "字段名称": item.get("column_name"),
+                                "综合相似度": item.get("best_similarity"),
+                                "字段名相似度": item.get("column_similarity"),
+                                "值相似度": item.get("value_similarity"),
+                                "命中文本": item.get("matched_text"),
+                                "对应值": item.get("matched_value"),
+                                "命中类型": item.get("match_type"),
+                            }
+                            for item in hits
+                        ])
+                        hits_df = hits_df.sort_values(by="综合相似度", ascending=False, kind="stable")
+                        st.dataframe(hits_df, use_container_width=True, hide_index=True)
+                    else:
+                        st.info("当前 query 没有召回到结果。")
+                else:
+                    st.error(res.get("error") or "ES 召回失败")
+    else:
+        st.info("当前没有可用的数据表")
 
 elif page == "📂 数据库浏览":
     st.markdown('<div class="custom-title">📂 Database Explorer</div>', unsafe_allow_html=True)
@@ -451,6 +523,10 @@ elif page == "📥 导入表格":
                     st.write("字段:", ", ".join(result["columns"]))
                 if result.get("build_statement"):
                     st.code(result.get("build_statement"), language="sql")
+                if result.get("es_sync_success") is True:
+                    st.info(f"ES 索引已同步，新增文档数：{result.get('es_indexed_documents')}")
+                elif result.get("es_sync_success") is False:
+                    st.warning(f"SQLite 已导入，但 ES 同步失败：{result.get('es_error')}")
                 st.cache_data.clear()
                 if not st.session_state.multi_table_mode:
                     st.session_state.selected_table = result.get("table_name")
@@ -474,6 +550,10 @@ elif page == "🗑️ 删除表格":
                     result = delete_table_api(target)
                 if result.get("success"):
                     st.success(f"删除成功：{result.get('table_name')}")
+                    if result.get("es_sync_success") is True:
+                        st.info(f"ES 索引已同步删除，删除文档数：{result.get('es_deleted_documents')}")
+                    elif result.get("es_sync_success") is False:
+                        st.warning(f"SQLite 已删除，但 ES 同步失败：{result.get('es_error')}")
                     st.cache_data.clear()
                     if st.session_state.get("selected_table") == target:
                         st.session_state.selected_table = None

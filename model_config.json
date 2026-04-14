@@ -1,29 +1,12 @@
 {
   "models": {
-    "2k-SFT-Qwen3-8B": {
-      "type": "local",
-      "url": "http://127.0.0.1:8002",
-      "description": "本地Qwen3-8B模型"
-    },
-    "9k-SFT-Qwen3-8B": {
-      "type": "local",
-      "url": "http://127.0.0.1:8001",
-      "description": "本地Qwen3-8B模型"
-    },
-    "claude-sonnet-4-20250514": {
+    "claude-opus-4-5-20251101": {
       "type": "online",
-      "url": "http://api.dbh.baidu-int.com",
-      "model": "claude-sonnet-4-20250514",
-      "api_key": "Bearer sk-R0IzpiMrMcxV0qsQ9y2ZnYU050h9xmATHseIYItQgHeIEqJS",
-      "description": "Claude Sonnet 4在线模型"
-    },
-    "claude-sonnet-4-6": {
-      "type": "online",
-      "url": "http://api.dbh.baidu-int.com",
-      "model": "claude-sonnet-4-6",
-      "api_key": "Bearer sk-R0IzpiMrMcxV0qsQ9y2ZnYU050h9xmATHseIYItQgHeIEqJS",
-      "description": "Claude Sonnet 4-6在线模型"
+      "url": "https://api.aibob.cn",
+      "model": "claude-opus-4-5-20251101",
+      "api_key": "Bearer sk-SqmQQrqwuSsspfj6mTPjvg5TVcLjCm3vmF1uqBqecsJ6tOwy",
+      "description": "Claude Opus 4.5 在线模型"
     }
   },
-  "default_model": "claude-sonnet-4-6"
+  "default_model": "claude-opus-4-5-20251101"
 }

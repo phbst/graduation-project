@@ -1,4 +1,5 @@
 from io import BytesIO
+from datetime import timedelta
 import json
 import os
 import random
@@ -9,6 +10,8 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import requests
+from es_prompt_builder import es_prompt_builder
+from es_schema_indexer import es_schema_indexer
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
@@ -18,6 +21,10 @@ PROMPT_TEMPLATE_FILE = "infer.template"
 CHART_PROMPT_TEMPLATE_FILE = "chart_infer.template"
 DB_CONFIG_FILE = "config.json"
 MODEL_CONFIG_FILE = "model_config.json"
+PROMPTBUILD_COLUMN_TOPK = int(os.getenv("PROMPTBUILD_COLUMN_TOPK", "8"))
+PROMPTBUILD_VALUE_TOPK = int(os.getenv("PROMPTBUILD_VALUE_TOPK", "5"))
+PROMPTBUILD_THRESHOLD = float(os.getenv("PROMPTBUILD_THRESHOLD", "0.35"))
+PROMPTBUILD_MAX_COLUMNS_PER_TABLE = int(os.getenv("PROMPTBUILD_MAX_COLUMNS_PER_TABLE", "12"))
 
 TEMPERATURE = 0
 REQUEST_TIMEOUT = 30
@@ -56,6 +63,30 @@ class ChartSuggestionRequest(BaseModel):
     model_name: Optional[str] = None
 
 
+class PromptBuildRequest(BaseModel):
+    query: str
+    table_names: List[str]
+    model_name: Optional[str] = None
+    column_topk: int = PROMPTBUILD_COLUMN_TOPK
+    value_topk: int = PROMPTBUILD_VALUE_TOPK
+    similarity_threshold: float = PROMPTBUILD_THRESHOLD
+    max_columns_per_table: int = PROMPTBUILD_MAX_COLUMNS_PER_TABLE
+
+
+class ESRebuildRequest(BaseModel):
+    table_names: Optional[List[str]] = None
+
+
+class ESAddTablesRequest(BaseModel):
+    table_names: List[str]
+
+
+class ESRecallRequest(BaseModel):
+    table_name: str
+    query: str
+    topk: int = 10
+
+
 # ========== 响应模型 ==========
 class QueryResponse(BaseModel):
     success: bool
@@ -63,6 +94,9 @@ class QueryResponse(BaseModel):
     data: Optional[List[Dict[str, Any]]] = None
     columns: Optional[List[str]] = None
     total_rows: Optional[int] = None
+    matched_schema: Optional[List[Dict[str, Any]]] = None
+    simplified_schema: Optional[str] = None
+    es_used: Optional[bool] = None
     error: Optional[str] = None
     model_response: Optional[str] = None
 
@@ -93,12 +127,18 @@ class ImportExcelResponse(BaseModel):
     columns: Optional[List[str]] = None
     total_rows: Optional[int] = None
     build_statement: Optional[str] = None
+    es_sync_success: Optional[bool] = None
+    es_indexed_documents: Optional[int] = None
+    es_error: Optional[str] = None
     error: Optional[str] = None
 
 
 class DeleteTableResponse(BaseModel):
     success: bool
     table_name: Optional[str] = None
+    es_sync_success: Optional[bool] = None
+    es_deleted_documents: Optional[int] = None
+    es_error: Optional[str] = None
     error: Optional[str] = None
 
 
@@ -108,6 +148,34 @@ class ChartSuggestionResponse(BaseModel):
     chart: Optional[Dict[str, Any]] = None
     model_name: Optional[str] = None
     raw_response: Optional[str] = None
+    error: Optional[str] = None
+
+
+class PromptBuildResponse(BaseModel):
+    success: bool
+    prompt: Optional[str] = None
+    simplified_schema: Optional[str] = None
+    matched_schema: Optional[List[Dict[str, Any]]] = None
+    model_name: Optional[str] = None
+    error: Optional[str] = None
+
+
+class ESIndexResponse(BaseModel):
+    success: bool
+    indexed_tables: Optional[List[str]] = None
+    indexed_documents: Optional[int] = None
+    deleted_documents: Optional[int] = None
+    doc_count: Optional[int] = None
+    errors: Optional[List[Any]] = None
+    error: Optional[str] = None
+
+
+class ESRecallResponse(BaseModel):
+    success: bool
+    table_name: Optional[str] = None
+    query: Optional[str] = None
+    topk: Optional[int] = None
+    hits: Optional[List[Dict[str, Any]]] = None
     error: Optional[str] = None
 
 
@@ -275,6 +343,26 @@ def read_uploaded_table(file_name: str, content: bytes, sheet_name: Optional[str
     raise HTTPException(status_code=400, detail="仅支持上传 .xlsx、.xls 或 .csv 文件")
 
 
+def normalize_dataframe_values(df: pd.DataFrame) -> pd.DataFrame:
+    normalized_df = df.copy()
+
+    for col in normalized_df.columns:
+        series = normalized_df[col]
+
+        if pd.api.types.is_timedelta64_dtype(series):
+            normalized_df[col] = series.apply(lambda x: None if pd.isna(x) else str(x))
+            continue
+
+        if series.dtype == "object":
+            has_timedelta = series.dropna().map(
+                lambda x: isinstance(x, (pd.Timedelta, timedelta))
+            ).any()
+            if has_timedelta:
+                normalized_df[col] = series.apply(lambda x: None if pd.isna(x) else str(x))
+
+    return normalized_df
+
+
 def import_dataframe_to_db(df: pd.DataFrame, table_name: str, if_exists: str = "replace") -> Dict[str, Any]:
     global db_config
 
@@ -287,6 +375,7 @@ def import_dataframe_to_db(df: pd.DataFrame, table_name: str, if_exists: str = "
 
     df = df.copy()
     df.columns = normalized_columns
+    df = normalize_dataframe_values(df)
     normalized_table_name = normalize_table_name(table_name)
 
     conn = sqlite3.connect(DB_PATH)
@@ -390,17 +479,45 @@ def delete_table_from_db(table_name: str) -> str:
     return normalized_table_name
 
 
-def call_model_api(query: str, table_names: Optional[List[str]] = None, model_name: Optional[str] = None) -> str:
+def call_model_api(query: str, table_names: Optional[List[str]] = None, model_name: Optional[str] = None) -> Dict[str, Any]:
     build_statement = ""
+    used_es_prompt = False
+    matched_schema = None
+
     if table_names and db_config:
-        table_builds = []
-        for table_name in table_names:
-            if table_name in db_config:
-                table_builds.append(f"【{table_name}】\n{db_config[table_name]['build']}")
-        build_statement = "\n\n".join(table_builds)
+        try:
+            simplified_schema, matched_schema = es_prompt_builder.build_prompt_schema(
+                query=query,
+                table_names=table_names,
+                db_config=db_config,
+                column_topk=PROMPTBUILD_COLUMN_TOPK,
+                value_topk=PROMPTBUILD_VALUE_TOPK,
+                similarity_threshold=PROMPTBUILD_THRESHOLD,
+                max_columns_per_table=PROMPTBUILD_MAX_COLUMNS_PER_TABLE,
+            )
+            build_statement = simplified_schema
+            used_es_prompt = True
+            print(f"[INFO] /query 使用 ES 压缩 schema，表: {table_names}")
+        except Exception as e:
+            print(f"[WARN] ES 压缩 schema 失败，回退到完整 schema: {e}")
+
+        if not build_statement:
+            table_builds = []
+            for table_name in table_names:
+                if table_name in db_config:
+                    table_builds.append(f"【{table_name}】\n{db_config[table_name]['build']}")
+            build_statement = "\n\n".join(table_builds)
 
     prompt = render_prompt(PROMPT_TEMPLATE_FILE, query=query, build=build_statement)
-    return call_model_with_prompt(prompt, model_name=model_name)["content"]
+    if used_es_prompt:
+        print(f"[INFO] 压缩后 prompt schema 长度: {len(build_statement)}")
+    model_result = call_model_with_prompt(prompt, model_name=model_name)
+    return {
+        "content": model_result["content"],
+        "simplified_schema": build_statement if used_es_prompt else None,
+        "matched_schema": matched_schema if used_es_prompt else None,
+        "es_used": used_es_prompt,
+    }
 
 
 def extract_sql(resp: str) -> str:
@@ -466,6 +583,8 @@ async def startup_event():
         raise RuntimeError("无法加载数据库配置")
     if not load_model_config():
         raise RuntimeError("无法加载模型配置")
+    es_prompt_builder.init_es_client()
+    es_schema_indexer.init_es_client()
 
 
 @app.get("/", summary="根路径")
@@ -531,7 +650,8 @@ async def query_data(request: QueryRequest):
     log_type = 0
 
     try:
-        model_response = call_model_api(query_text, table_names, model_name)
+        model_api_result = call_model_api(query_text, table_names, model_name)
+        model_response = model_api_result["content"]
         print(f"[INFO] 模型请求成功 {model_response}")
         sql = extract_sql(model_response)
         print(f"[INFO] 提取SQL成功 {sql}")
@@ -556,12 +676,102 @@ async def query_data(request: QueryRequest):
             data=result["data"],
             columns=result["columns"],
             total_rows=result["total_rows"],
+            matched_schema=model_api_result.get("matched_schema"),
+            simplified_schema=model_api_result.get("simplified_schema"),
+            es_used=model_api_result.get("es_used"),
             model_response=model_response,
         )
     except Exception as e:
         if log_type == 0:
             save_query_log({"query": query_text, "tables": table_names, "llm_res": model_response, "sql": sql, "type": 1 if sql else 0})
         return QueryResponse(success=False, error=str(e))
+
+
+@app.post("/promptbuild", response_model=PromptBuildResponse, summary="构建压缩版 Prompt")
+async def prompt_build(request: PromptBuildRequest):
+    try:
+        simplified_schema, matched_schema = es_prompt_builder.build_prompt_schema(
+            query=request.query,
+            table_names=request.table_names,
+            db_config=db_config,
+            column_topk=request.column_topk,
+            value_topk=request.value_topk,
+            similarity_threshold=request.similarity_threshold,
+            max_columns_per_table=request.max_columns_per_table,
+        )
+        prompt = render_prompt(PROMPT_TEMPLATE_FILE, query=request.query, build=simplified_schema)
+        return PromptBuildResponse(
+            success=True,
+            prompt=prompt,
+            simplified_schema=simplified_schema,
+            matched_schema=matched_schema,
+            model_name=request.model_name,
+        )
+    except HTTPException as e:
+        return PromptBuildResponse(success=False, error=str(e.detail))
+    except Exception as e:
+        return PromptBuildResponse(success=False, error=str(e))
+
+
+@app.post("/es/rebuild", response_model=ESIndexResponse, summary="重建 ES Schema 索引")
+async def rebuild_es_index(request: ESRebuildRequest):
+    try:
+        result = es_schema_indexer.rebuild_index(DB_PATH, request.table_names)
+        return ESIndexResponse(
+            success=True,
+            indexed_tables=result["indexed_tables"],
+            indexed_documents=result["indexed_documents"],
+            doc_count=result["doc_count"],
+            errors=result["errors"],
+        )
+    except HTTPException as e:
+        return ESIndexResponse(success=False, error=str(e.detail))
+    except Exception as e:
+        return ESIndexResponse(success=False, error=str(e))
+
+
+@app.post("/es/add_tables", response_model=ESIndexResponse, summary="按表新增或刷新 ES Schema 索引")
+async def add_tables_to_es_index(request: ESAddTablesRequest):
+    try:
+        result = es_schema_indexer.add_tables(DB_PATH, request.table_names)
+        return ESIndexResponse(
+            success=True,
+            indexed_tables=result["indexed_tables"],
+            indexed_documents=result["indexed_documents"],
+            deleted_documents=result["deleted_documents"],
+            errors=result["errors"],
+        )
+    except HTTPException as e:
+        return ESIndexResponse(success=False, error=str(e.detail))
+    except Exception as e:
+        return ESIndexResponse(success=False, error=str(e))
+
+
+@app.post("/es/recall", response_model=ESRecallResponse, summary="按表执行 ES 召回")
+async def es_recall(request: ESRecallRequest):
+    try:
+        table_name = request.table_name.strip()
+        if not table_name:
+            raise HTTPException(status_code=400, detail="table_name 不能为空")
+        if not db_config or table_name not in db_config:
+            raise HTTPException(status_code=400, detail=f"表 '{table_name}' 不存在")
+
+        hits = es_prompt_builder.recall_columns(
+            query=request.query,
+            table_names=[table_name],
+            topk=request.topk,
+        )
+        return ESRecallResponse(
+            success=True,
+            table_name=table_name,
+            query=request.query,
+            topk=request.topk,
+            hits=hits,
+        )
+    except HTTPException as e:
+        return ESRecallResponse(success=False, error=str(e.detail))
+    except Exception as e:
+        return ESRecallResponse(success=False, error=str(e))
 
 
 @app.post("/execute_raw_sql", response_model=RawSQLResponse, summary="执行原生SQL")
@@ -591,12 +801,24 @@ async def import_excel(
 
         df = read_uploaded_table(file.filename or "uploaded.xlsx", content, sheet_name)
         result = import_dataframe_to_db(df, table_name, if_exists)
+        try:
+            es_result = es_schema_indexer.add_tables(DB_PATH, [result["table_name"]])
+            es_sync_success = True
+            es_indexed_documents = es_result["indexed_documents"]
+            es_error = None
+        except Exception as es_exc:
+            es_sync_success = False
+            es_indexed_documents = None
+            es_error = str(es_exc)
         return ImportExcelResponse(
             success=True,
             table_name=result["table_name"],
             columns=result["columns"],
             total_rows=result["total_rows"],
             build_statement=result["build_statement"],
+            es_sync_success=es_sync_success,
+            es_indexed_documents=es_indexed_documents,
+            es_error=es_error,
         )
     except HTTPException as e:
         return ImportExcelResponse(success=False, error=str(e.detail))
@@ -608,7 +830,23 @@ async def import_excel(
 async def delete_table(table_name: str):
     try:
         deleted_table_name = delete_table_from_db(table_name)
-        return DeleteTableResponse(success=True, table_name=deleted_table_name)
+        try:
+            es_result = es_schema_indexer.remove_tables([deleted_table_name])
+            es_sync_success = True
+            es_deleted_documents = es_result["deleted_documents"]
+            es_error = None
+        except Exception as es_exc:
+            es_sync_success = False
+            es_deleted_documents = None
+            es_error = str(es_exc)
+
+        return DeleteTableResponse(
+            success=True,
+            table_name=deleted_table_name,
+            es_sync_success=es_sync_success,
+            es_deleted_documents=es_deleted_documents,
+            es_error=es_error,
+        )
     except HTTPException as e:
         return DeleteTableResponse(success=False, error=str(e.detail))
     except Exception as e:
